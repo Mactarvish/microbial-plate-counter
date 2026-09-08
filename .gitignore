@@ -161,3 +161,8 @@ cython_debug/
 
 pgs
 .DS_Store
+# web runtime
+uploads/
+data/
+colony_counts.csv
+
