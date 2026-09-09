@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>菌落计数</title>
+  <style>
+    :root { color-scheme: light; --bg:#f4f6f8; --card:#fff; --line:#d0d7de; --txt:#1f2328; --acc:#0969da; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; background:var(--bg); color:var(--txt); }
+    header { background:var(--card); border-bottom:1px solid var(--line); padding:12px 16px; display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+    h1 { font-size:18px; margin:0 12px 0 0; }
+    .panel { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    button, label.btn { background:var(--acc); color:#fff; border:0; border-radius:6px; padding:8px 12px; cursor:pointer; font-size:14px; }
+    button.secondary { background:#57606a; }
+    button:disabled { opacity:.5; cursor:not-allowed; }
+    input[type=file] { display:none; }
+    .modes label { margin-right:10px; cursor:pointer; }
+    main { padding:12px 16px 24px; }
+    .stats { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:10px 12px; margin-bottom:12px; line-height:1.6; }
+    .wrap { background:#111; border-radius:8px; overflow:auto; max-height:calc(100vh - 220px); }
+    canvas { display:block; cursor:crosshair; max-width:100%; height:auto; }
+    .hint { color:#656d76; font-size:13px; }
+    .err { color:#cf222e; }
+    #hosts { font-size:13px; color:#57606a; }
+    #hosts code { background:#eef1f4; padding:2px 6px; border-radius:4px; margin-right:6px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>菌落计数 Web</h1>
+    <div class="panel">
+      <label class="btn">上传图片<input id="file" type="file" accept="image/*" multiple /></label>
+      <label class="btn">上传目录<input id="dir" type="file" webkitdirectory directory multiple /></label>
+      <button id="prev" class="secondary" type="button">上一张</button>
+      <button id="next" class="secondary" type="button">下一张</button>
+      <span class="modes">
+        <label><input type="radio" name="mode" value="circle" checked /> 霍夫圆心拉圆</label>
+        <label><input type="radio" name="mode" value="curve" /> 自由曲线</label>
+      </span>
+      <button id="clear" class="secondary" type="button">清除选区</button>
+      <button id="csv" class="secondary" type="button">下载CSV</button>
+    </div>
+  </header>
+  <main>
+    <div id="hosts" class="stats hint">探测访问地址中…</div>
+    <div id="info" class="stats hint">可多选图片或直接上传整个目录。默认拉圆；松手后分别统计选区红/绿/蓝并写入 CSV。</div>
+    <div class="wrap"><canvas id="cv"></canvas></div>
+  </main>
+  <script>
+    const fileEl = document.getElementById('file');
+    const dirEl = document.getElementById('dir');
+    const infoEl = document.getElementById('info');
+    const hostsEl = document.getElementById('hosts');
+    const cv = document.getElementById('cv');
+    const ctx = cv.getContext('2d');
+    let jobs = [];
+    let idx = 0;
+    let job = null;
+    let img = new Image();
+    let scale = 1;
+    let drawing = false;
+    let pts = [];
+    let previewR = null;
+
+    function mode() {
+      return document.querySelector('input[name=mode]:checked').value;
+    }
+
+    function setInfo(html, isErr=false) {
+      infoEl.className = 'stats' + (isErr ? ' err' : '');
+      infoEl.innerHTML = html;
+    }
+
+    function showJobStats(extra='') {
+      if (!job) return;
+      const c = job.counts;
+      setInfo(
+        `<b>${job.filename}</b> (${idx + 1}/${jobs.length}) 全图 红=${c.red} 绿=${c.green} 蓝=${c.blue} 合计=${c.total}` + extra
+      );
+    }
+
+    async function loadImage(b64) {
+      return new Promise((resolve, reject) => {
+        img = new Image();
+        img.onload = () => resolve();
+        img.onerror = reject;
+        img.src = 'data:image/jpeg;base64,' + b64;
+      });
+    }
+
+    function fitCanvas() {
+      const maxW = Math.min(window.innerWidth - 40, img.width);
+      scale = maxW / img.width;
+      cv.width = Math.round(img.width * scale);
+      cv.height = Math.round(img.height * scale);
+      redraw();
+    }
+
+    function redraw(extraDraw) {
+      ctx.clearRect(0, 0, cv.width, cv.height);
+      ctx.drawImage(img, 0, 0, cv.width, cv.height);
+      if (extraDraw) extraDraw();
+    }
+
+    function canvasToImg(x, y) {
+      return [x / scale, y / scale];
+    }
+
+    async function showIdx(i) {
+      if (!jobs.length) return;
+      idx = (i + jobs.length) % jobs.length;
+      job = jobs[idx];
+      pts = [];
+      previewR = null;
+      await loadImage(job.image);
+      fitCanvas();
+      showJobStats();
+    }
+
+    async function uploadFiles(fileList) {
+      const files = [...fileList].filter(f => /\.(jpe?g|png|bmp|tiff?|webp)$/i.test(f.name));
+      if (!files.length) {
+        setInfo('未找到图片文件', true);
+        return;
+      }
+      setInfo(`批量计数中 0/${files.length}…`);
+      const fd = new FormData();
+      files.forEach(f => fd.append('files', f));
+      try {
+        const res = await fetch('/api/count', { method: 'POST', body: fd });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || '计数失败');
+        jobs = data.jobs || [];
+        const failN = (data.failed || []).length;
+        if (!jobs.length) throw new Error('全部失败');
+        await showIdx(0);
+        if (failN) {
+          showJobStats(` ｜ 成功 ${jobs.length}，失败 ${failN}`);
+        }
+      } catch (e) {
+        setInfo(e.message, true);
+      }
+    }
+
+    fileEl.addEventListener('change', () => uploadFiles(fileEl.files));
+    dirEl.addEventListener('change', () => uploadFiles(dirEl.files));
+    document.getElementById('prev').onclick = () => showIdx(idx - 1);
+    document.getElementById('next').onclick = () => showIdx(idx + 1);
+
+    document.getElementById('clear').onclick = () => {
+      pts = [];
+      previewR = null;
+      if (job) {
+        loadImage(job.image).then(() => { fitCanvas(); showJobStats(); });
+      }
+    };
+
+    document.getElementById('csv').onclick = () => { window.location.href = '/api/csv'; };
+
+    cv.addEventListener('mousedown', (e) => {
+      if (!job) return;
+      drawing = true;
+      const rect = cv.getBoundingClientRect();
+      const x = e.clientX - rect.left, y = e.clientY - rect.top;
+      if (mode() === 'circle') {
+        const [mx, my] = canvasToImg(x, y);
+        const { cx, cy } = job.circle;
+        previewR = Math.max(1, Math.hypot(mx - cx, my - cy));
+        redraw(() => drawCirclePreview(previewR));
+      } else {
+        pts = [[x, y]];
+      }
+    });
+
+    cv.addEventListener('mousemove', (e) => {
+      if (!drawing || !job) return;
+      const rect = cv.getBoundingClientRect();
+      const x = e.clientX - rect.left, y = e.clientY - rect.top;
+      if (mode() === 'circle') {
+        const [mx, my] = canvasToImg(x, y);
+        const { cx, cy } = job.circle;
+        previewR = Math.max(1, Math.hypot(mx - cx, my - cy));
+        redraw(() => drawCirclePreview(previewR));
+      } else {
+        const last = pts[pts.length - 1];
+        if ((x - last[0]) ** 2 + (y - last[1]) ** 2 < 9) return;
+        pts.push([x, y]);
+        redraw(() => drawCurvePreview(pts));
+      }
+    });
+
+    cv.addEventListener('mouseup', async (e) => {
+      if (!drawing || !job) return;
+      drawing = false;
+      const rect = cv.getBoundingClientRect();
+      const x = e.clientX - rect.left, y = e.clientY - rect.top;
+      let body;
+      if (mode() === 'circle') {
+        const [mx, my] = canvasToImg(x, y);
+        const { cx, cy } = job.circle;
+        const r = Math.max(1, Math.round(Math.hypot(mx - cx, my - cy)));
+        body = { job_id: job.job_id, mode: 'circle', r };
+      } else {
+        pts.push([x, y]);
+        if (pts.length < 3) return;
+        const imgPts = pts.map(([px, py]) => canvasToImg(px, py));
+        body = { job_id: job.job_id, mode: 'curve', points: imgPts };
+      }
+      setInfo('写入选区统计…');
+      try {
+        const res = await fetch('/api/roi', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || '选区失败');
+        job.image = data.image;
+        jobs[idx] = job;
+        await loadImage(data.image);
+        fitCanvas();
+        const r = data.roi;
+        showJobStats(` ｜ 选区 红=${r.red} 绿=${r.green} 蓝=${r.blue} 合计=${r.total} ｜ 已写入 CSV`);
+      } catch (err) {
+        setInfo(err.message, true);
+      }
+    });
+
+    function drawCirclePreview(r) {
+      const { cx, cy } = job.circle;
+      ctx.strokeStyle = '#ffff00';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(cx * scale, cy * scale, r * scale, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.fillStyle = '#ffff00';
+      ctx.beginPath();
+      ctx.arc(cx * scale, cy * scale, 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    function drawCurvePreview(p) {
+      if (p.length < 2) return;
+      ctx.strokeStyle = '#ffff00';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(p[0][0], p[0][1]);
+      for (let i = 1; i < p.length; i++) ctx.lineTo(p[i][0], p[i][1]);
+      ctx.stroke();
+      if (p.length >= 3) {
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath();
+        ctx.moveTo(p[p.length - 1][0], p[p.length - 1][1]);
+        ctx.lineTo(p[0][0], p[0][1]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
+
+    fetch('/api/hostinfo').then(r => r.json()).then(d => {
+      const codes = (d.urls || []).map(u => `<code>${u}</code>`).join(' ');
+      hostsEl.innerHTML = `局域网/本机访问地址：${codes || '未探测到'}`;
+    }).catch(() => { hostsEl.textContent = '访问地址探测失败'; });
+
+    window.addEventListener('resize', () => { if (job) fitCanvas(); });
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowLeft') showIdx(idx - 1);
+      if (e.key === 'ArrowRight') showIdx(idx + 1);
+    });
+  </script>
+</body>
+</html>
